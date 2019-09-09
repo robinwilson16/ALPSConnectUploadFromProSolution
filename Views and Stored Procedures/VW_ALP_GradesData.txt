@@ -1,0 +1,17 @@
+CREATE VIEW VW_ALP_GradesData
+AS
+
+	SELECT * FROM OPENQUERY(FIFI1, '
+	SET FMTONLY OFF; 
+	EXEC WLC.dbo.SPR_ALP_GradesData
+		WITH RESULT SETS
+		(
+			(
+				"Student ID" CHAR(12),
+				"Exam Type" VARCHAR(50),
+				Subject VARCHAR(80),
+				Grade CHAR(6)
+			)
+		);
+	') X
+GO

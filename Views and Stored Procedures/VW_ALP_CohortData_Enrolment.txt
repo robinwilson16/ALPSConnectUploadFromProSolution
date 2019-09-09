@@ -1,0 +1,19 @@
+CREATE VIEW VW_ALP_CohortData_Enrolment
+AS
+
+	SELECT * FROM OPENQUERY(FIFI1, '
+	SET FMTONLY OFF; 
+	EXEC WLC.dbo.SPR_ALP_CohortData_Enrolment
+		WITH RESULT SETS
+		(
+			(
+				"Student ID" CHAR(12),
+				"Exam Type" VARCHAR(50),
+				Subject VARCHAR(80),
+				"Teaching Set" VARCHAR(3),
+				Teacher VARCHAR(100),
+				"Study Year" VARCHAR(2)
+			)
+		);
+	') X
+GO

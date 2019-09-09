@@ -1,0 +1,135 @@
+CREATE PROCEDURE SPR_ALP_CohortData_Enrolment
+AS
+BEGIN
+	SET NOCOUNT ON;
+	
+	IF OBJECT_ID('tempdb..#EarliestStart') IS NOT NULL
+		DROP TABLE #EarliestStart
+
+	SELECT
+		SD.StudentID,
+		EarliestStartDate = MIN ( ENR.StartDate )
+	INTO #EarliestStart
+	FROM ProSolution.dbo.StudentDetail SD
+	INNER JOIN ProSolution.dbo.Enrolment ENR
+		ON ENR.StudentDetailID = SD.StudentDetailID
+	WHERE
+		ENR.CompletionStatusID IN ( '1', '2', '3' )
+		AND ENR.IncludeInReturn = 1
+	GROUP BY
+		SD.StudentID
+
+	SELECT
+		"Student ID" = SD.RefNo,
+		"Exam Type" = COALESCE ( QAN.AlpsExamType, '' ),
+		Subject = COALESCE ( QAN.AlpsSubject, AIM.LEARNING_AIM_TITLE ),
+		"Teaching Set" = GRP.Code,
+		Teacher = 
+			CASE
+				WHEN STF.StaffID IS NULL THEN '-- Unknown --'
+				ELSE STF.FirstName + ' ' + STF.Surname + ' (' + STF.StaffRefNo + ')'
+			END,
+		"Study Year" = 
+			CASE
+				WHEN CAST ( ENR.StartDate AS DATE ) >= '20' + LEFT ( CRS.AcademicYearID, 2 ) + '-08-01' THEN '12' --Started this year
+				WHEN CAST ( ENR.StartDate AS DATE ) >= '20' + CAST ( CAST ( LEFT ( CRS.AcademicYearID, 2 ) AS INT ) - 1 AS VARCHAR(2) ) + '-08-01' THEN '13' --Started last year
+				WHEN CAST ( ENR.StartDate AS DATE ) >= '20' + CAST ( CAST ( LEFT ( CRS.AcademicYearID, 2 ) AS INT ) - 2 AS VARCHAR(2) ) + '-08-01' THEN '14' --Started year before year
+				WHEN CAST ( ENR.StartDate AS DATE ) < '20' + CAST ( CAST ( LEFT ( CRS.AcademicYearID, 2 ) AS INT ) - 2 AS VARCHAR(2) ) + '-08-01' THEN '14' --Started earlier
+				ELSE 0
+			END
+	FROM ProSolution.dbo.StudentDetail SD
+	INNER JOIN ProSolution.dbo.Enrolment ENR
+		ON ENR.StudentDetailID = SD.StudentDetailID
+	INNER JOIN ProSolution.dbo.Offering CRS
+		ON CRS.OfferingID = ENR.OfferingID
+	INNER JOIN ProSolution.dbo.Learning_Aim AIM
+		ON AIM.LEARNING_AIM_REF = CRS.QualID
+	INNER JOIN (
+		SELECT DISTINCT
+			PLR.StudentID
+		FROM ProSolution.dbo.PLRDownload PLR
+		INNER JOIN ProSolution.dbo.PLRLearnerEventDownload PLRD
+			ON PLRD.PLRDownloadID = PLR.PLRDownloadID
+		INNER JOIN #EarliestStart EAR
+			ON EAR.StudentID = PLR.StudentID
+		LEFT JOIN ProSolution.dbo.Learning_Aim AIM
+			ON AIM.LEARNING_AIM_REF = PLRD.SourceQualificationCode
+		WHERE
+			(
+				PLRD.QualificationTitle LIKE '%GCSE%'
+				OR AIM.LEARNING_AIM_TITLE LIKE '%GCSE%'
+			)
+			AND PLRD.AwardDate IS NOT NULL
+			AND PLRD.AwardDate < EAR.EarliestStartDate
+	) HasQOE
+		ON HasQOE.StudentID = SD.StudentID
+	LEFT JOIN ProSolution.dbo.OfferingGroup GRP
+		ON GRP.OfferingGroupID = ENR.OfferingGroupID
+	LEFT JOIN wlc.dbo.ALPS_QANAimMappings QAN
+		ON QAN.QAN = AIM.LEARNING_AIM_REF
+	LEFT JOIN (
+		SELECT
+			CRS.OfferingID,
+			GRP.OfferingGroupID,
+			LEC.StaffID,
+			Lessons = COUNT ( REGSC.RegisterScheduleID ),
+			RowNum = ROW_NUMBER () OVER ( 
+				PARTITION BY
+					CRS.OfferingID,
+					GRP.OfferingGroupID
+				ORDER BY
+					COUNT ( REGSC.RegisterScheduleID ) DESC,
+					STF.StaffRefNo
+			)
+		FROM ProSolution.dbo.Offering CRS
+		LEFT JOIN ProSolution.dbo.OfferingGroup GRP
+			ON GRP.OfferingID = CRS.OfferingID
+		INNER JOIN ProSolution.dbo.RegisterCourse REGC
+			ON REGC.OfferingID = CRS.OfferingID
+			AND COALESCE ( REGC.OfferingGroupID, 0 ) = COALESCE ( GRP.OfferingGroupID, 0 )
+		INNER JOIN ProSolution.dbo.Register REG
+			ON REG.RegisterID = REGC.RegisterID
+		INNER JOIN ProSolution.dbo.RegisterSchedule REGSC
+			ON REGSC.RegisterID = REG.RegisterID
+		INNER JOIN ProSolution.dbo.RegisterScheduleLecturer REGSCL
+			ON REGSCL.RegisterScheduleID = REGSC.RegisterScheduleID
+		INNER JOIN ProSolution.dbo.RegisterLecturer LEC
+			ON LEC.RegisterLecturerID = REGSCL.RegisterLecturerID
+		INNER JOIN ProSolution.dbo.Staff STF
+			ON STF.StaffID = LEC.StaffID
+		WHERE
+			CRS.AcademicYearID = (
+				SELECT
+					CFG.Value
+				FROM Config CFG
+				WHERE
+					CFG.ConfigID = 'ALP_AcademicYearID'
+			)
+		GROUP BY
+			CRS.OfferingID,
+			GRP.OfferingGroupID,
+			LEC.StaffID,
+			STF.StaffRefNo
+	) LEC
+		ON LEC.OfferingID = CRS.OfferingID
+		AND COALESCE ( LEC.OfferingGroupID, 0 ) = COALESCE ( GRP.OfferingGroupID, 0 )
+		AND LEC.RowNum = 1
+	LEFT JOIN ProSolution.dbo.Staff STF
+		ON STF.StaffID = LEC.StaffID
+	WHERE
+		SD.AcademicYearID = (
+			SELECT
+				CFG.Value
+			FROM Config CFG
+			WHERE
+				CFG.ConfigID = 'ALP_AcademicYearID'
+		)
+		AND ENR.CompletionStatusID IN ( '1', '2', '3' )
+		AND ENR.IncludeInReturn = 1
+		AND AIM.NOTIONAL_NVQ_LEVEL_CODE = '3'
+		--AND ENR.ExpectedEndDate <= '20' + RIGHT ( CRS.AcademicYearID, 2 ) + '-07-31'
+		--AND SD.RefNo = '11020029'
+
+	IF OBJECT_ID('tempdb..#EarliestStart') IS NOT NULL
+		DROP TABLE #EarliestStart
+END

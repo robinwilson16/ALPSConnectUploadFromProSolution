@@ -1,0 +1,226 @@
+ALTER VIEW [dbo].[VW_ALP_CohortData_Student]
+AS
+	WITH EarliestStart AS (
+		SELECT
+			SD.StudentID,
+			EarliestStartDate = MIN ( ENR.StartDate )
+		FROM ProSolution.dbo.StudentDetail SD
+		INNER JOIN ProSolution.dbo.Enrolment ENR
+			ON ENR.StudentDetailID = SD.StudentDetailID
+		WHERE
+			ENR.CompletionStatusID IN ( '1', '2', '3' )
+			AND ENR.IncludeInReturn = 1
+		GROUP BY
+			SD.StudentID
+	)
+
+	SELECT
+		"Student ID" = SD.RefNo,
+		UPN = S.UniqueLearnerNo,
+		Surname = SD.Surname,
+		Forename = SD.FirstForename,
+		"Tutor Group" = TUT.TutorGroupCode,
+		"Year Group" = MA.YearGroup,
+		"Date of Birth" = SD.DateOfBirth,
+		Gender = SD.Sex,
+		Ethnicity = SD.EthnicGroupID,
+		Disadvantage = 
+			CASE
+				WHEN PCU.SFA_UPLIFT > 1 THEN 'Y'
+				WHEN PCU.EFA_UPLIFT > 1 THEN 'Y'
+				ELSE 'N'
+			END,
+		"KS2 Fine Score" = '',
+		"Avg. GCSE Score" = PLR.AvgGCSE
+	FROM ProSolution.dbo.StudentDetail SD
+	INNER JOIN ProSolution.dbo.Student S
+		ON S.StudentID = SD.StudentID
+	INNER JOIN (
+		SELECT
+			SD.StudentID,
+			ADR.StudentAddressID,
+			AddressOrder = 
+				ROW_NUMBER () OVER ( 
+					PARTITION BY
+						ADR.StudentID
+					ORDER BY
+						ADR.isPrimary DESC,
+						ADR.DateTo,
+						ADR.StudentAddressID DESC
+				)
+		FROM ProSolution.dbo.StudentDetail SD
+		INNER JOIN ProSolution.dbo.StudentAddress ADR
+			ON ADR.StudentID = SD.StudentID
+		WHERE
+			SD.AcademicYearID = (
+				SELECT
+					CFG.Value
+				FROM Config CFG
+				WHERE
+					CFG.ConfigID = 'ALP_AcademicYearID'
+			)
+	) ADRM
+		ON ADRM.StudentID = SD.StudentID
+		AND ADRM.AddressOrder = 1
+	INNER JOIN ProSolution.dbo.StudentAddress ADR
+		ON ADR.StudentAddressID = ADRM.StudentAddressID
+	INNER JOIN (
+		SELECT
+			ENR.StudentDetailID,
+			MainCourseCode = CRS.Code,
+			YearGroup =
+				CASE
+					WHEN CAST ( ENR.StartDate AS DATE ) >= '20' + LEFT ( CRS.AcademicYearID, 2 ) + '-08-01' THEN '12' --Started this year
+					WHEN CAST ( ENR.StartDate AS DATE ) >= '20' + CAST ( CAST ( LEFT ( CRS.AcademicYearID, 2 ) AS INT ) - 1 AS VARCHAR(2) ) + '-08-01' THEN '13' --Started last year
+					WHEN CAST ( ENR.StartDate AS DATE ) >= '20' + CAST ( CAST ( LEFT ( CRS.AcademicYearID, 2 ) AS INT ) - 2 AS VARCHAR(2) ) + '-08-01' THEN '14' --Started year before year
+					WHEN CAST ( ENR.StartDate AS DATE ) < '20' + CAST ( CAST ( LEFT ( CRS.AcademicYearID, 2 ) AS INT ) - 2 AS VARCHAR(2) ) + '-08-01' THEN '14' --Started earlier
+					ELSE 0
+				END,
+			RowNum = 
+				ROW_NUMBER () OVER ( 
+					PARTITION BY
+						ENR.StudentDetailID
+					ORDER BY
+						ENR.IncludeInReturn DESC,
+						COALESCE ( ENR.ProgrammeTypeID, '99' ),
+						CASE
+							WHEN ENR.AimTypeID = 2 THEN 4.5
+							ELSE ENR.AimTypeID
+						END DESC,
+						ENR.CompletionStatusID,
+						DATEDIFF ( DAY, ENR.StartDate, COALESCE ( ENR.ActualEndDate, ENR.ExpectedEndDate ) ) DESC,
+						COALESCE ( ENR.PlannedLearningHours, 0 ) + COALESCE ( ENR.PlannedEEPHours, 0 ) DESC,
+						ENR.StartDate,
+						ENR.EnrolmentID
+				)
+		FROM ProSolution.dbo.Offering CRS
+		INNER JOIN ProSolution.dbo.Enrolment ENR
+			ON ENR.OfferingID = CRS.OfferingID
+		INNER JOIN ProSolution.dbo.OfferingGroup GRP
+			ON GRP.OfferingGroupID = ENR.OfferingGroupID
+		INNER JOIN ProSolution.dbo.Learning_Aim AIM
+			ON AIM.LEARNING_AIM_REF = CRS.QualID
+		WHERE
+			CRS.AcademicYearID = (
+				SELECT
+					CFG.Value
+				FROM Config CFG
+				WHERE
+					CFG.ConfigID = 'ALP_AcademicYearID'
+			)
+			AND CRS.OfferingStatusID IN ( '1', '3' ) --Live and pending only
+			AND ENR.IncludeInReturn = 1
+			AND AIM.NOTIONAL_NVQ_LEVEL_CODE = '3'
+	) MA
+		ON MA.StudentDetailID = SD.StudentDetailID
+		AND MA.RowNum = 1
+	INNER JOIN (
+		SELECT
+			StudentID = QOE.StudentID,
+			NumGCSEs = COUNT ( QOE.StudentID ),
+			AvgGCSE = SUM ( QOE.Points ) / COUNT ( QOE.StudentID )
+		FROM (
+			SELECT DISTINCT
+				PLR.StudentID,
+				PLRD.SourceQualificationCode,
+				PLRD.QualificationTitle,
+				PLRD.AwardDate,
+				PLRD.Grade,
+				GCSE.Points,
+				GradeOrder = 
+					ROW_NUMBER () OVER ( 
+						PARTITION BY 
+							PLR.StudentID, 
+							PLRD.SourceQualificationCode
+						ORDER BY 
+							CASE
+								WHEN PLRD.Grade = 'A*' THEN 1
+								ELSE 2
+							END,
+							PLRD.Grade 
+					)
+			FROM ProSolution.dbo.PLRDownload PLR
+			INNER JOIN ProSolution.dbo.PLRLearnerEventDownload PLRD
+				ON PLRD.PLRDownloadID = PLR.PLRDownloadID
+			INNER JOIN EarliestStart EAR
+				ON EAR.StudentID = PLR.StudentID
+			INNER JOIN ALPS_GCSEPoints GCSE
+				ON GCSE.Grade = PLRD.Grade
+			LEFT JOIN ProSolution.dbo.Learning_Aim AIM
+				ON AIM.LEARNING_AIM_REF = PLRD.SourceQualificationCode
+			WHERE
+				(
+					PLRD.QualificationTitle LIKE '%GCSE%'
+					OR AIM.LEARNING_AIM_TITLE LIKE '%GCSE%'
+				)
+				AND PLRD.AwardDate IS NOT NULL
+				AND PLRD.AwardDate < EAR.EarliestStartDate
+		) QOE
+		WHERE
+			QOE.GradeOrder = 1
+			--AND QOE.StudentID = 75672
+		GROUP BY
+			QOE.StudentID
+	) PLR
+		ON PLR.StudentID = SD.StudentID
+	LEFT JOIN (
+		SELECT
+			ENR.StudentDetailID,
+			TutorGroupCode = CRS.Code + '-' + GRP.Code,
+			RowNum = 
+				ROW_NUMBER () OVER ( 
+					PARTITION BY
+						ENR.StudentDetailID
+					ORDER BY
+						CASE
+							WHEN CRS.QualID = 'CMISC001' THEN 1
+							ELSE 0
+						END DESC,
+						CASE
+							WHEN CRS.Code LIKE '%TUT%' THEN 1
+							ELSE 0
+						END DESC,
+						ENR.IncludeInReturn DESC,
+						COALESCE ( ENR.ProgrammeTypeID, '99' ),
+						CASE
+							WHEN ENR.AimTypeID = 2 THEN 4.5
+							ELSE ENR.AimTypeID
+						END DESC,
+						ENR.CompletionStatusID,
+						DATEDIFF ( DAY, ENR.StartDate, COALESCE ( ENR.ActualEndDate, ENR.ExpectedEndDate ) ) DESC,
+						COALESCE ( ENR.PlannedLearningHours, 0 ) + COALESCE ( ENR.PlannedEEPHours, 0 ) DESC,
+						ENR.StartDate,
+						ENR.EnrolmentID
+				)
+		FROM ProSolution.dbo.Offering CRS
+		INNER JOIN ProSolution.dbo.Enrolment ENR
+			ON ENR.OfferingID = CRS.OfferingID
+		INNER JOIN ProSolution.dbo.OfferingGroup GRP
+			ON GRP.OfferingGroupID = ENR.OfferingGroupID
+		WHERE
+			CRS.AcademicYearID = (
+				SELECT
+					CFG.Value
+				FROM Config CFG
+				WHERE
+					CFG.ConfigID = 'ALP_AcademicYearID'
+			)
+			AND CRS.OfferingStatusID IN ( '1', '3' ) --Live and pending only
+			AND COALESCE ( CRS.QualID, 'CMISC001' ) = 'CMISC001'
+	) TUT
+		ON TUT.StudentDetailID = SD.StudentDetailID
+		AND TUT.RowNum = 1
+	LEFT JOIN Hegel.Progeneral.dbo.PostCodeUplift PCU
+		ON PCU.PostCode = ADR.PostcodeOut + ' ' + ADR.PostcodeIn
+	WHERE
+		SD.AcademicYearID = (
+				SELECT
+					CFG.Value
+				FROM Config CFG
+				WHERE
+					CFG.ConfigID = 'ALP_AcademicYearID'
+			)
+	--ORDER BY
+	--	SD.Surname,
+	--	SD.FirstForename,
+	--	SD.RefNo
